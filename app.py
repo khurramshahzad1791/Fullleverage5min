@@ -6,11 +6,9 @@ import numpy as np
 import plotly.graph_objects as go
 from datetime import datetime, timedelta
 import time
-from threading import Thread, Event
-import queue
 
 st.set_page_config(
-    page_title="BTC·ETH·XRP·SOL Trade Station",
+    page_title="Advanced Crypto Scanner",
     page_icon="📡",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -50,8 +48,8 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-st.markdown('<h1 class="main-header">📡 BTC · ETH · XRP · SOL Trade Station</h1>', unsafe_allow_html=True)
-st.markdown("Real‑time scanning • Active trade management • Institutional‑grade")
+st.markdown('<h1 class="main-header">📡 Advanced Crypto Scanner</h1>', unsafe_allow_html=True)
+st.markdown("BTC · ETH · XRP · SOL • Binance • Manual refresh • Institutional‑grade")
 
 # -------------------- SIDEBAR --------------------
 with st.sidebar:
@@ -62,40 +60,45 @@ with st.sidebar:
     now_pkt = datetime.utcnow() + timedelta(hours=5)
     st.info(f"**PKT:** {now_pkt.strftime('%H:%M:%S')}")
 
+    # Exchange selection (Binance by default)
+    exchange_name = st.selectbox("Exchange", ["binance", "binanceusdm", "mexc"], index=0)
+
     # Risk parameters
     st.markdown("### 💰 Risk Management")
     account_balance = st.number_input("Account (USDT)", value=1000, step=100)
     risk_per_trade = st.slider("Risk per trade (%)", 0.1, 2.0, 0.5, 0.1) / 100
     max_leverage = st.selectbox("Max Leverage", [50, 100, 200, 300, 500], index=1)
 
-    # Update frequency
-    update_sec = st.slider("Refresh interval (sec)", 10, 120, 30, 5)
+    # Pairs (fixed)
+    PAIRS = ["BTC/USDT", "ETH/USDT", "XRP/USDT", "SOL/USDT"]
 
     st.markdown("---")
     if st.button("🔄 Reset All Trades"):
-        for key in list(st.session_state.keys()):
-            if key not in ['pairs']:
+        for key in ['signals', 'active_trades', 'data_cache']:
+            if key in st.session_state:
                 del st.session_state[key]
         st.rerun()
 
-# Fixed pairs
-PAIRS = ["BTC/USDT", "ETH/USDT", "XRP/USDT", "SOL/USDT"]
-
 # -------------------- SESSION STATE --------------------
 if 'signals' not in st.session_state:
-    st.session_state.signals = {}          # latest signals per pair
+    st.session_state.signals = {}
 if 'active_trades' not in st.session_state:
-    st.session_state.active_trades = []    # list of dicts for taken trades
-if 'last_update' not in st.session_state:
-    st.session_state.last_update = None
+    st.session_state.active_trades = []
 if 'data_cache' not in st.session_state:
-    st.session_state.data_cache = {}       # store OHLCV data per pair per timeframe
+    st.session_state.data_cache = {}
+if 'last_scan' not in st.session_state:
+    st.session_state.last_scan = None
 
 # -------------------- DATA FETCHING --------------------
 def fetch_ohlcv(symbol, tf='5m', limit=200):
-    """Fetch OHLCV from Binance (futures)"""
+    """Fetch OHLCV from selected exchange."""
     try:
-        exchange = ccxt.binanceusdm({'enableRateLimit': True, 'timeout': 10000})
+        if exchange_name == "binance":
+            exchange = ccxt.binance({'enableRateLimit': True, 'timeout': 10000})
+        elif exchange_name == "binanceusdm":
+            exchange = ccxt.binanceusdm({'enableRateLimit': True, 'timeout': 10000})
+        else:
+            exchange = ccxt.mexc({'enableRateLimit': True, 'timeout': 10000})
         ohlcv = exchange.fetch_ohlcv(symbol, tf, limit=limit)
         df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
@@ -262,6 +265,19 @@ def generate_signal(pair, df_5m, df_1h):
     else:
         grade = "C"
 
+    # Position size suggestion
+    risk_amount = account_balance * risk_per_trade
+    stop_distance = abs(entry - sl)
+    if stop_distance == 0:
+        position_size = 0
+    else:
+        position_size = risk_amount / stop_distance
+    required_leverage = position_size / account_balance
+    if required_leverage > max_leverage:
+        leverage_warning = f"⚠️ Needs {required_leverage:.1f}x > {max_leverage}x"
+    else:
+        leverage_warning = f"✓ Uses {required_leverage:.1f}x"
+
     return {
         'pair': pair,
         'regime': regime,
@@ -274,14 +290,21 @@ def generate_signal(pair, df_5m, df_1h):
         'tp1': tp1,
         'tp2': tp2,
         'timestamp': datetime.now(),
-        'price': entry
+        'price': entry,
+        'position_size': position_size,
+        'leverage_warning': leverage_warning
     }
 
-# -------------------- UPDATE SIGNALS --------------------
-def update_all_signals():
-    """Fetch fresh data and generate signals for all pairs."""
-    new_signals = {}
-    for pair in PAIRS:
+# -------------------- SCAN ALL PAIRS --------------------
+def scan_all():
+    """Fetch data for all pairs and generate signals."""
+    signals = {}
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    data_cache = {}
+
+    for i, pair in enumerate(PAIRS):
+        status_text.text(f"Scanning {pair}...")
         df_5m = fetch_ohlcv(pair, '5m', 200)
         df_1h = fetch_ohlcv(pair, '1h', 200)
         if df_5m is not None and df_1h is not None:
@@ -289,98 +312,68 @@ def update_all_signals():
             df_1h = compute_indicators(df_1h)
             sig = generate_signal(pair, df_5m, df_1h)
             if sig:
-                new_signals[pair] = sig
-            # Store data for chart
-            st.session_state.data_cache[pair] = (df_5m, df_1h)
-    st.session_state.signals = new_signals
-    st.session_state.last_update = datetime.now()
+                signals[pair] = sig
+            data_cache[pair] = (df_5m, df_1h)
+        progress_bar.progress((i + 1) / len(PAIRS))
+        time.sleep(0.5)  # avoid rate limits
+
+    status_text.text("Scan complete!")
+    time.sleep(1)
+    status_text.empty()
+    progress_bar.empty()
+
+    return signals, data_cache
 
 # -------------------- TRADE MANAGEMENT --------------------
-def update_active_trades():
-    """Check active trades against current price and suggest actions."""
-    for trade in st.session_state.active_trades:
-        pair = trade['pair']
-        # Get current price from latest signal or fresh fetch
-        if pair in st.session_state.data_cache:
-            df_5m, _ = st.session_state.data_cache[pair]
-            current_price = df_5m['close'].iloc[-1]
+def update_trade_suggestions(trade, current_price):
+    """Update a trade with current price and suggestion."""
+    trade['current_price'] = current_price
+    if trade['direction'] == 'LONG':
+        trade['pnl_pct'] = (current_price - trade['entry']) / trade['entry'] * 100
+        if current_price >= trade['tp1']:
+            trade['suggestion'] = "✅ TP1 reached – take partial profits or move SL to breakeven"
+        elif current_price >= trade['entry'] + (trade['tp1'] - trade['entry']) * 0.5:
+            trade['suggestion'] = "📈 50% to TP1 – consider moving SL to breakeven"
+        elif current_price <= trade['sl']:
+            trade['suggestion'] = "❌ Stop hit – trade closed (update manually)"
         else:
-            # fallback fetch
-            df = fetch_ohlcv(pair, '1m', 1)
-            if df is not None:
-                current_price = df['close'].iloc[-1]
-            else:
-                continue
+            trade['suggestion'] = "⏳ Holding"
+    else:  # SHORT
+        trade['pnl_pct'] = (trade['entry'] - current_price) / trade['entry'] * 100
+        if current_price <= trade['tp1']:
+            trade['suggestion'] = "✅ TP1 reached – take partial profits or move SL to breakeven"
+        elif current_price <= trade['entry'] - (trade['entry'] - trade['tp1']) * 0.5:
+            trade['suggestion'] = "📈 50% to TP1 – consider moving SL to breakeven"
+        elif current_price >= trade['sl']:
+            trade['suggestion'] = "❌ Stop hit – trade closed (update manually)"
+        else:
+            trade['suggestion'] = "⏳ Holding"
+    return trade
 
-        trade['current_price'] = current_price
-        if trade['direction'] == 'LONG':
-            trade['pnl_pct'] = (current_price - trade['entry']) / trade['entry'] * 100
-            # Suggestions
-            if current_price >= trade['tp1']:
-                trade['suggestion'] = "✅ TP1 reached – take partial profits or move SL to breakeven"
-            elif current_price >= trade['entry'] + (trade['tp1'] - trade['entry']) * 0.5:
-                trade['suggestion'] = "📈 50% to TP1 – consider moving SL to breakeven"
-            elif current_price <= trade['sl']:
-                trade['suggestion'] = "❌ Stop hit – trade closed (update manually)"
-            else:
-                trade['suggestion'] = "⏳ Holding"
-        else:  # SHORT
-            trade['pnl_pct'] = (trade['entry'] - current_price) / trade['entry'] * 100
-            if current_price <= trade['tp1']:
-                trade['suggestion'] = "✅ TP1 reached – take partial profits or move SL to breakeven"
-            elif current_price <= trade['entry'] - (trade['entry'] - trade['tp1']) * 0.5:
-                trade['suggestion'] = "📈 50% to TP1 – consider moving SL to breakeven"
-            elif current_price >= trade['sl']:
-                trade['suggestion'] = "❌ Stop hit – trade closed (update manually)"
-            else:
-                trade['suggestion'] = "⏳ Holding"
-
-# -------------------- BACKGROUND THREAD FOR AUTO-UPDATE --------------------
-class DataUpdater(Thread):
-    def __init__(self, interval):
-        super().__init__()
-        self.interval = interval
-        self.stop_event = Event()
-
-    def run(self):
-        while not self.stop_event.is_set():
-            update_all_signals()
-            update_active_trades()
-            time.sleep(self.interval)
-
-    def stop(self):
-        self.stop_event.set()
-
-# Start background thread if not already running
-if 'updater_thread' not in st.session_state:
-    st.session_state.updater_thread = DataUpdater(update_sec)
-    st.session_state.updater_thread.daemon = True
-    st.session_state.updater_thread.start()
-
-# -------------------- UI: MAIN AREA --------------------
-# Metrics bar
-col1, col2, col3, col4, col5 = st.columns(5)
+# -------------------- MAIN UI --------------------
+# Scan button
+col1, col2, col3 = st.columns(3)
 with col1:
-    st.metric("BTC", "Signal" if "BTC/USDT" in st.session_state.signals else "—")
+    if st.button("🔍 Scan Now", use_container_width=True):
+        with st.spinner("Fetching market data..."):
+            signals, cache = scan_all()
+            st.session_state.signals = signals
+            st.session_state.data_cache = cache
+            st.session_state.last_scan = datetime.now()
+        st.rerun()
 with col2:
-    st.metric("ETH", "Signal" if "ETH/USDT" in st.session_state.signals else "—")
+    if st.session_state.last_scan:
+        st.info(f"Last scan: {st.session_state.last_scan.strftime('%H:%M:%S')}")
 with col3:
-    st.metric("XRP", "Signal" if "XRP/USDT" in st.session_state.signals else "—")
-with col4:
-    st.metric("SOL", "Signal" if "SOL/USDT" in st.session_state.signals else "—")
-with col5:
     st.metric("Active Trades", len(st.session_state.active_trades))
 
-if st.session_state.last_update:
-    st.caption(f"Last update: {st.session_state.last_update.strftime('%H:%M:%S')}")
-
 # -------------------- CURRENT SIGNALS --------------------
-st.subheader("📡 Live Signals")
+st.subheader("📡 Current Signals")
 if st.session_state.signals:
-    cols = st.columns(4)
+    cols = st.columns(len(st.session_state.signals))
     for i, (pair, sig) in enumerate(st.session_state.signals.items()):
-        with cols[i % 4]:
-            grade_color = {
+        with cols[i]:
+            grade_class = {
                 'A+': 'grade-AAA',
                 'A': 'grade-AA',
                 'B+': 'grade-A',
@@ -390,16 +383,15 @@ if st.session_state.signals:
             st.markdown(f"""
             <div class="signal-card">
                 <h3>{pair.replace('/USDT','')}</h3>
-                <p><span class="{grade_color}">{sig['grade']}</span> • {sig['direction']}</p>
+                <p><span class="{grade_class}">{sig['grade']}</span> • {sig['direction']}</p>
                 <p>Entry: ${sig['entry']:.2f}</p>
                 <p>SL: ${sig['sl']:.2f} | TP1: ${sig['tp1']:.2f}</p>
                 <p>{sig['strategy']} • {sig['regime']}</p>
+                <p>{sig['leverage_warning']}</p>
             </div>
             """, unsafe_allow_html=True)
 
-            # Take trade button
             if st.button(f"📥 Take {pair}", key=f"take_{pair}"):
-                # Add to active trades
                 new_trade = sig.copy()
                 new_trade['taken_at'] = datetime.now()
                 new_trade['current_price'] = sig['entry']
@@ -408,19 +400,28 @@ if st.session_state.signals:
                 st.session_state.active_trades.append(new_trade)
                 st.rerun()
 else:
-    st.info("No signals at the moment. Waiting for next update...")
+    st.info("No signals at the moment. Click 'Scan Now' to fetch data.")
 
 # -------------------- ACTIVE TRADES --------------------
 st.subheader("📊 Active Trades")
 if st.session_state.active_trades:
+    # Update trades with latest price from cache if available
+    for trade in st.session_state.active_trades:
+        pair = trade['pair']
+        if pair in st.session_state.data_cache:
+            df_5m, _ = st.session_state.data_cache[pair]
+            current_price = df_5m['close'].iloc[-1]
+            trade = update_trade_suggestions(trade, current_price)
+
+    # Display trades
     for i, trade in enumerate(st.session_state.active_trades):
         with st.container():
             col1, col2, col3, col4, col5, col6 = st.columns(6)
-            pair = trade['pair'].replace('/USDT','')
+            pair_short = trade['pair'].replace('/USDT','')
             pnl = trade['pnl_pct']
             pnl_class = "profit" if pnl >= 0 else "loss"
             with col1:
-                st.markdown(f"**{pair}** {trade['direction']}")
+                st.markdown(f"**{pair_short}** {trade['direction']}")
             with col2:
                 st.markdown(f"Entry: ${trade['entry']:.2f}")
             with col3:
@@ -435,23 +436,21 @@ if st.session_state.active_trades:
             # Action buttons
             cola, colb, colc, cold = st.columns(4)
             with cola:
-                if st.button(f"🔒 Close {pair}", key=f"close_{i}"):
+                if st.button(f"🔒 Close {pair_short}", key=f"close_{i}"):
                     st.session_state.active_trades.pop(i)
                     st.rerun()
             with colb:
-                if st.button(f"🎯 Move SL to Breakeven", key=f"be_{i}"):
+                if st.button(f"🎯 Move SL to BE", key=f"be_{i}"):
                     trade['sl'] = trade['entry']
                     trade['suggestion'] = "SL moved to breakeven"
                     st.rerun()
             with colc:
-                if st.button(f"💰 Take 50% Profit", key=f"tp50_{i}"):
-                    # Simulate taking half profit – adjust entry for remaining half? 
-                    # For simplicity, just note suggestion.
+                if st.button(f"💰 Take 50%", key=f"tp50_{i}"):
                     trade['suggestion'] = "Took 50% profit at current price"
+                    # Optionally adjust entry or keep record
                     st.rerun()
             with cold:
                 if st.button(f"📈 Trail SL", key=f"trail_{i}"):
-                    # Trail by 0.5 ATR? For demo, move to 50% of profit.
                     if trade['direction'] == 'LONG':
                         new_sl = trade['current_price'] - (trade['current_price'] - trade['entry']) * 0.3
                     else:
@@ -500,6 +499,23 @@ if selected_chart in st.session_state.data_cache:
         template="plotly_dark"
     )
     st.plotly_chart(fig, use_container_width=True)
+else:
+    st.info("No chart data yet. Click 'Scan Now' to load.")
 
-# -------------------- CLEANUP ON EXIT --------------------
-# (Note: Streamlit doesn't have a direct on-exit hook, but we can ignore – thread will be killed when app stops)
+# -------------------- DOWNLOAD SIGNALS --------------------
+if st.session_state.signals:
+    df_export = pd.DataFrame([
+        {
+            'Pair': k,
+            'Grade': v['grade'],
+            'Direction': v['direction'],
+            'Entry': v['entry'],
+            'SL': v['sl'],
+            'TP1': v['tp1'],
+            'TP2': v['tp2'],
+            'Strategy': v['strategy'],
+            'Regime': v['regime']
+        } for k, v in st.session_state.signals.items()
+    ])
+    csv = df_export.to_csv(index=False)
+    st.download_button("📥 Download Signals CSV", csv, "signals.csv", mime="text/csv")
